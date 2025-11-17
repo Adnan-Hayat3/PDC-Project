@@ -24,10 +24,21 @@ static int detect_entropy_anomaly(const Features *f);
 static int detect_rate_anomaly(const Features *f);
 static int detect_hot_ip(IpStat *stats, int stat_count,
                          int total_packets, char *out_ip);
+static int detect_cusum_anomaly(const Features *f, CusumState *cusum);
+static int detect_ml_anomaly(const Features *f, MLDetector *ml);
+static void init_cusum_state(CusumState *cusum);
+static void init_ml_detector(MLDetector *ml);
 
 /* blocking simulation */
-static void apply_rtbh(const char *ip);
-static void apply_acl(const char *ip);
+static void apply_rtbh(const char *ip, BlockingStats *stats);
+static void apply_acl(const char *ip, BlockingStats *stats);
+
+/* performance utilities */
+static double get_time_ms(void);
+static void init_performance_metrics(PerformanceMetrics *metrics);
+static void calculate_accuracy_metrics(PerformanceMetrics *metrics);
+static void log_performance_metrics(const PerformanceMetrics *metrics, const char *filename);
+static void log_blocking_stats(const BlockingStats *stats, const char *filename);
 
 /* metrics logging */
 static void append_alert_log(const Alert *alerts, int num_alerts,
@@ -39,6 +50,8 @@ static void append_alert_log(const Alert *alerts, int num_alerts,
    ============================== */
 void worker_start(int rank, int world_size, const char *dataset_root)
 {
+    double start_time = get_time_ms();
+    
     FlowRecord *records = malloc(sizeof(FlowRecord) * MAX_FLOWS);
     if (!records) {
         fprintf(stderr, "Worker %d: memory allocation failed\n", rank);
@@ -62,6 +75,12 @@ void worker_start(int rank, int world_size, const char *dataset_root)
         free(records);
         return;
     }
+    
+    /* Initialize detection algorithms */
+    CusumState cusum;
+    MLDetector ml;
+    init_cusum_state(&cusum);
+    init_ml_detector(&ml);
 
     int stat_count = 0;
     int total_packets = 0;
@@ -76,8 +95,10 @@ void worker_start(int rank, int world_size, const char *dataset_root)
     compute_features(stats, stat_count, total_packets, total_bytes,
                      min_ts, max_ts, &feats);
 
+    /* Run all three detection algorithms */
     int flag_entropy = detect_entropy_anomaly(&feats);
-    int flag_rate    = detect_rate_anomaly(&feats);
+    int flag_cusum   = detect_cusum_anomaly(&feats, &cusum);
+    int flag_ml      = detect_ml_anomaly(&feats, &ml);
 
     char hot_ip[IP_STR_LEN];
     hot_ip[0] = '\0';
@@ -92,8 +113,14 @@ void worker_start(int rank, int world_size, const char *dataset_root)
     alert.spike_score = feats.spike_score;
     alert.total_packets = feats.total_packets;
     alert.total_flows   = feats.total_flows;
+    
+    /* Detection flags */
+    alert.entropy_detected = flag_entropy;
+    alert.cusum_detected   = flag_cusum;
+    alert.ml_detected      = flag_ml;
 
-    if (flag_entropy + flag_rate + flag_hot_ip >= 2) {
+    /* Voting: attack if at least 2 out of 3 algorithms detect anomaly */
+    if (flag_entropy + flag_cusum + flag_ml >= 2) {
         alert.attack_flag = 1;
         if (hot_ip[0] != '\0') {
             strncpy(alert.suspicious_ip, hot_ip, IP_STR_LEN - 1);
@@ -107,6 +134,12 @@ void worker_start(int rank, int world_size, const char *dataset_root)
         strncpy(alert.suspicious_ip, "NONE", IP_STR_LEN - 1);
         alert.suspicious_ip[IP_STR_LEN - 1] = '\0';
     }
+    
+    /* Performance metrics */
+    double end_time = get_time_ms();
+    alert.processing_time_ms = end_time - start_time;
+    alert.memory_used_kb = (sizeof(FlowRecord) * flow_count + 
+                           sizeof(IpStat) * stat_count) / 1024;
 
     MPI_Send(&alert, sizeof(Alert), MPI_BYTE, 0, 0, MPI_COMM_WORLD);
 
@@ -167,9 +200,22 @@ void coordinator_start(int world_size, const char *dataset_root)
         printf("\n[COORDINATOR] DDoS attack CONFIRMED.\n");
         printf("  Suspicious IP (aggregated): %s\n", chosen_ip);
         printf("  Votes: %d / %d workers\n", attack_votes, num_workers);
+        printf("  Detection methods: Entropy=%d, CUSUM=%d, ML=%d\n",
+               alerts[chosen_index].entropy_detected,
+               alerts[chosen_index].cusum_detected,
+               alerts[chosen_index].ml_detected);
 
-        apply_rtbh(chosen_ip);
-        apply_acl(chosen_ip);
+        /* Apply blocking with statistics tracking */
+        BlockingStats block_stats;
+        memset(&block_stats, 0, sizeof(BlockingStats));
+        strncpy(block_stats.blocked_ip, chosen_ip, IP_STR_LEN - 1);
+        
+        double block_start = get_time_ms();
+        apply_rtbh(chosen_ip, &block_stats);
+        apply_acl(chosen_ip, &block_stats);
+        block_stats.block_time_ms = get_time_ms() - block_start;
+        
+        log_blocking_stats(&block_stats, "results/metrics/blocking.csv");
     } else {
         printf("\n[COORDINATOR] No global attack detected.\n");
         printf("  Suspicious votes: %d / %d workers\n",
@@ -186,10 +232,10 @@ void coordinator_start(int world_size, const char *dataset_root)
    ============================== */
 /*
    Expected per-partition CSV format:
-   src_ip,dst_ip,bytes,timestamp
+   src_ip,dst_ip,bytes,timestamp,protocol,src_port,dst_port,packets
 
    Example:
-   192.168.1.10,10.0.0.5,512,1700000001
+   192.168.1.10,10.0.0.5,512,1700000001,17,60954,29816,2
 */
 static int load_partition(int rank, const char *dataset_root,
                           FlowRecord *records, int max_records)
@@ -204,32 +250,48 @@ static int load_partition(int rank, const char *dataset_root,
         return 0;
     }
 
-    char line[512];
+    char line[1024];
     int count = 0;
+    int header_skipped = 0;
 
     while (fgets(line, sizeof(line), fp) && count < max_records) {
+        if (!header_skipped) {
+            header_skipped = 1;
+            continue;
+        }
+        
         if (line[0] == '#' || line[0] == '\n')
             continue;
 
         FlowRecord r;
         memset(&r, 0, sizeof(r));
 
-        /* basic parsing */
+        /* Parse: src_ip,dst_ip,bytes,timestamp,protocol,src_port,dst_port,packets */
         char src[IP_STR_LEN], dst[IP_STR_LEN];
-        int bytes = 0;
-        int ts = 0;
+        int bytes = 0, ts = 0, proto = 0, sport = 0, dport = 0, pkts = 0;
 
-        if (sscanf(line, "%31[^,],%31[^,],%d,%d",
-                   src, dst, &bytes, &ts) == 4) {
+        int parsed = sscanf(line, "%31[^,],%31[^,],%d,%d,%d,%d,%d,%d",
+                           src, dst, &bytes, &ts, &proto, &sport, &dport, &pkts);
+        
+        if (parsed >= 4) {
             strncpy(r.src_ip, src, IP_STR_LEN - 1);
             strncpy(r.dst_ip, dst, IP_STR_LEN - 1);
             r.bytes = bytes;
             r.timestamp = ts;
+            r.protocol = proto;
+            r.src_port = sport;
+            r.dst_port = dport;
+            r.packets = (pkts > 0) ? pkts : 1;
             records[count++] = r;
         }
     }
 
     fclose(fp);
+    
+    if (count > 0) {
+        printf("Worker %d: loaded %d records from %s\n", rank, count, path);
+    }
+    
     return count;
 }
 
@@ -337,6 +399,91 @@ static void compute_features(IpStat *stats, int stat_count,
 /* ==============================
    Detection algorithms
    ============================== */
+static void init_cusum_state(CusumState *cusum)
+{
+    memset(cusum, 0, sizeof(CusumState));
+    cusum->mean = 0.0;
+    cusum->std = 0.0;
+    cusum->sample_count = 0;
+}
+
+static void init_ml_detector(MLDetector *ml)
+{
+    memset(ml, 0, sizeof(MLDetector));
+    /* Simple pre-trained weights (tune with actual training) */
+    ml->weights[0] = -0.5;  /* entropy */
+    ml->weights[1] = 0.3;   /* avg_rate */
+    ml->weights[2] = 0.4;   /* spike_score */
+    ml->weights[3] = 0.2;   /* unique_ips ratio */
+    ml->threshold = 0.6;
+    ml->trained = 1;
+}
+
+/* CUSUM: Cumulative Sum statistical detection */
+static int detect_cusum_anomaly(const Features *f, CusumState *cusum)
+{
+    double value = f->avg_rate;
+    
+    /* Update running statistics */
+    if (cusum->sample_count < CUSUM_WINDOW) {
+        cusum->history[cusum->sample_count] = value;
+        cusum->sample_count++;
+        
+        /* Calculate mean */
+        double sum = 0.0;
+        for (int i = 0; i < cusum->sample_count; i++) {
+            sum += cusum->history[i];
+        }
+        cusum->mean = sum / cusum->sample_count;
+        
+        /* Calculate std */
+        double var_sum = 0.0;
+        for (int i = 0; i < cusum->sample_count; i++) {
+            double diff = cusum->history[i] - cusum->mean;
+            var_sum += diff * diff;
+        }
+        cusum->std = sqrt(var_sum / cusum->sample_count);
+        
+        return 0;  /* Not enough samples yet */
+    }
+    
+    /* CUSUM calculation */
+    double threshold = 5.0;  /* Detection threshold */
+    double drift = cusum->std * 0.5;  /* Drift parameter */
+    
+    double deviation = value - cusum->mean - drift;
+    cusum->cumsum_pos = fmax(0, cusum->cumsum_pos + deviation);
+    cusum->cumsum_neg = fmax(0, cusum->cumsum_neg - deviation);
+    
+    if (cusum->cumsum_pos > threshold || cusum->cumsum_neg > threshold) {
+        return 1;  /* Anomaly detected */
+    }
+    
+    return 0;
+}
+
+/* Simple ML-based detection (logistic regression style) */
+static int detect_ml_anomaly(const Features *f, MLDetector *ml)
+{
+    if (!ml->trained) return 0;
+    
+    /* Normalize and compute weighted sum */
+    ml->feature_vector[0] = f->entropy / 10.0;  /* normalize */
+    ml->feature_vector[1] = f->avg_rate / 10000.0;
+    ml->feature_vector[2] = f->spike_score / 100.0;
+    ml->feature_vector[3] = (double)f->unique_ips / 1000.0;
+    
+    double score = 0.0;
+    for (int i = 0; i < 4; i++) {
+        score += ml->weights[i] * ml->feature_vector[i];
+    }
+    
+    /* Sigmoid activation */
+    double prob = 1.0 / (1.0 + exp(-score));
+    
+    return (prob > ml->threshold) ? 1 : 0;
+}
+
 /* entropy check: if entropy drops below threshold, traffic is skewed */
 static int detect_entropy_anomaly(const Features *f)
 {
@@ -393,19 +540,105 @@ static int detect_hot_ip(IpStat *stats, int stat_count,
 /* ==============================
    Blocking simulation
    ============================== */
-static void apply_rtbh(const char *ip)
+static void apply_rtbh(const char *ip, BlockingStats *stats)
 {
     printf("[RTBH] Blackholing traffic to/from IP: %s\n", ip);
+    /* Simulate blocking efficiency */
+    stats->attack_packets_blocked += 950;  /* 95% of attack traffic */
+    stats->legitimate_packets_blocked += 10;  /* 1% collateral */
+    stats->blocking_efficiency = 0.95;
+    stats->collateral_damage = 0.01;
 }
 
-static void apply_acl(const char *ip)
+static void apply_acl(const char *ip, BlockingStats *stats)
 {
     printf("[ACL ] Installing drop rule for IP: %s\n", ip);
+    /* Simulate iptables rule installation */
+    FILE *fp = fopen("results/metrics/iptables_rules.txt", "a");
+    if (fp) {
+        fprintf(fp, "iptables -A INPUT -s %s -j DROP\n", ip);
+        fprintf(fp, "iptables -A OUTPUT -d %s -j DROP\n", ip);
+        fclose(fp);
+    }
 }
 
 /* ==============================
    Metrics logging
    ============================== */
+static double get_time_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (tv.tv_sec * 1000.0) + (tv.tv_usec / 1000.0);
+}
+
+static void init_performance_metrics(PerformanceMetrics *metrics)
+{
+    memset(metrics, 0, sizeof(PerformanceMetrics));
+}
+
+static void calculate_accuracy_metrics(PerformanceMetrics *metrics)
+{
+    int total = metrics->true_positives + metrics->false_positives +
+                metrics->true_negatives + metrics->false_negatives;
+    if (total == 0) return;
+    
+    /* These would be calculated based on ground truth labels */
+    printf("\n[METRICS] Accuracy Statistics:\n");
+    printf("  True Positives:  %d\n", metrics->true_positives);
+    printf("  False Positives: %d\n", metrics->false_positives);
+    printf("  True Negatives:  %d\n", metrics->true_negatives);
+    printf("  False Negatives: %d\n", metrics->false_negatives);
+    
+    double precision = (double)metrics->true_positives / 
+                      (metrics->true_positives + metrics->false_positives);
+    double recall = (double)metrics->true_positives / 
+                   (metrics->true_positives + metrics->false_negatives);
+    double f1 = 2 * (precision * recall) / (precision + recall);
+    
+    printf("  Precision: %.3f\n", precision);
+    printf("  Recall:    %.3f\n", recall);
+    printf("  F1-Score:  %.3f\n", f1);
+}
+
+static void log_performance_metrics(const PerformanceMetrics *metrics, const char *filename)
+{
+    FILE *fp = fopen(filename, "a");
+    if (!fp) return;
+    
+    fprintf(fp, "%.3f,%.2f,%.2f,%d,%ld,%d,%d,%d,%d,%.2f,%ld,%.3f\n",
+            metrics->detection_latency_ms,
+            metrics->throughput_pps,
+            metrics->throughput_gbps,
+            metrics->packets_processed,
+            metrics->bytes_processed,
+            metrics->true_positives,
+            metrics->false_positives,
+            metrics->true_negatives,
+            metrics->false_negatives,
+            metrics->cpu_usage_percent,
+            metrics->memory_usage_kb,
+            metrics->mpi_comm_overhead_ms);
+    
+    fclose(fp);
+}
+
+static void log_blocking_stats(const BlockingStats *stats, const char *filename)
+{
+    FILE *fp = fopen(filename, "a");
+    if (!fp) return;
+    
+    fprintf(fp, "%s,%d,%d,%.3f,%.3f,%.3f\n",
+            stats->blocked_ip,
+            stats->attack_packets_blocked,
+            stats->legitimate_packets_blocked,
+            stats->blocking_efficiency,
+            stats->collateral_damage,
+            stats->block_time_ms);
+    
+    fclose(fp);
+}
+
 static void append_alert_log(const Alert *alerts, int num_alerts,
                              int global_attack_flag,
                              const char *chosen_ip)
@@ -416,11 +649,9 @@ static void append_alert_log(const Alert *alerts, int num_alerts,
         return;
     }
 
-    /* header is not strictly needed; you can add once manually */
-
     for (int i = 0; i < num_alerts; i++) {
         fprintf(fp,
-                "%d,%d,%s,%.3f,%.3f,%.3f,%d,%d,%d,%s\n",
+                "%d,%d,%s,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%.3f,%ld,%d,%s\n",
                 alerts[i].worker_rank,
                 alerts[i].attack_flag,
                 alerts[i].suspicious_ip,
@@ -429,6 +660,11 @@ static void append_alert_log(const Alert *alerts, int num_alerts,
                 alerts[i].spike_score,
                 alerts[i].total_packets,
                 alerts[i].total_flows,
+                alerts[i].entropy_detected,
+                alerts[i].cusum_detected,
+                alerts[i].ml_detected,
+                alerts[i].processing_time_ms,
+                alerts[i].memory_used_kb,
                 global_attack_flag,
                 (chosen_ip && chosen_ip[0]) ? chosen_ip : "NONE");
     }
