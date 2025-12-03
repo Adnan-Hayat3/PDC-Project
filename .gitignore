@@ -1,2 +1,23 @@
 /.vscode
 /.devcontainer
+
+# Compiled binaries and objects
+*.o
+*.out
+ddos_detector
+csv_parser
+test_*
+
+# Test and temporary files
+test_output.log
+COMPLETE_TEST_REPORT.txt
+comprehensive_test.sh
+
+# Data and results directories
+data/
+results/
+partitions/
+
+# Large datasets
+CSV-01-12/
+CSV-03-11/

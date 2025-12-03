@@ -34,11 +34,11 @@ static void apply_rtbh(const char *ip, BlockingStats *stats);
 static void apply_acl(const char *ip, BlockingStats *stats);
 
 /* performance utilities */
-static double get_time_ms(void);
-static void init_performance_metrics(PerformanceMetrics *metrics);
-static void calculate_accuracy_metrics(PerformanceMetrics *metrics);
-static void log_performance_metrics(const PerformanceMetrics *metrics, const char *filename);
-static void log_blocking_stats(const BlockingStats *stats, const char *filename);
+double get_time_ms(void);
+void init_performance_metrics(PerformanceMetrics *metrics);
+void calculate_accuracy_metrics(PerformanceMetrics *metrics);
+void log_performance_metrics(const PerformanceMetrics *metrics, const char *filename);
+void log_blocking_stats(const BlockingStats *stats, const char *filename);
 
 /* metrics logging */
 static void append_alert_log(const Alert *alerts, int num_alerts,
@@ -565,19 +565,19 @@ static void apply_acl(const char *ip, BlockingStats *stats)
 /* ==============================
    Metrics logging
    ============================== */
-static double get_time_ms(void)
+double get_time_ms(void)
 {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (tv.tv_sec * 1000.0) + (tv.tv_usec / 1000.0);
 }
 
-static void init_performance_metrics(PerformanceMetrics *metrics)
+void init_performance_metrics(PerformanceMetrics *metrics)
 {
     memset(metrics, 0, sizeof(PerformanceMetrics));
 }
 
-static void calculate_accuracy_metrics(PerformanceMetrics *metrics)
+void calculate_accuracy_metrics(PerformanceMetrics *metrics)
 {
     int total = metrics->true_positives + metrics->false_positives +
                 metrics->true_negatives + metrics->false_negatives;
@@ -601,7 +601,7 @@ static void calculate_accuracy_metrics(PerformanceMetrics *metrics)
     printf("  F1-Score:  %.3f\n", f1);
 }
 
-static void log_performance_metrics(const PerformanceMetrics *metrics, const char *filename)
+void log_performance_metrics(const PerformanceMetrics *metrics, const char *filename)
 {
     FILE *fp = fopen(filename, "a");
     if (!fp) return;
@@ -623,7 +623,7 @@ static void log_performance_metrics(const PerformanceMetrics *metrics, const cha
     fclose(fp);
 }
 
-static void log_blocking_stats(const BlockingStats *stats, const char *filename)
+void log_blocking_stats(const BlockingStats *stats, const char *filename)
 {
     FILE *fp = fopen(filename, "a");
     if (!fp) return;
